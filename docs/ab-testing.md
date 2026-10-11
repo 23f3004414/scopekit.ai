@@ -1,0 +1,196 @@
+# A/B Testing Workflows
+
+This project includes a real A/B testing system for evaluating whether MCP usage reduces total context usage for a specific client and task.
+
+## What A/B testing means here
+
+We compare modes for the same task prompt:
+
+- A: `no_mcp`
+- B: `compact_search`
+- C: `graph`
+- D1: `context_broker`
+- D2: `context_broker_locked`
+
+The system combines manually entered client usage metrics with MCP telemetry output metrics.
+
+## Why client token usage must be measured separately
+
+Most GUI clients do not expose token and cost metrics programmatically. Because of that:
+
+- Guided/manual mode is the default and primary path.
+- You must record client usage numbers per run.
+- MCP benchmark numbers alone are not proof of real client savings.
+- For Codex, use Codex usage output/reporting/compliance APIs when available, otherwise enter usage manually.
+
+## Modes
+
+- **A no MCP**: baseline without MCP tools.
+- **B compact search**: favor `repo_map`, `search_code`, `get_project_commands`, `get_symbol_context`.
+- **C graph**: favor `graph_status`, `graph_query`, `graph_symbol`.
+- **D1 context broker**: call `context_status` once then `context_pack` once first; full toolset still exposed. **Not recommended for Codex savings proof** — Codex may enter tool loops. Hard fallback budgets apply (see prompt). Exceeding budgets classifies as `TOOL_LOOP_FAILURE`.
+- **D2 locked context broker**: expose only `context_status` and `context_pack` for Codex A/B proof tests.
+
+For mode D1, treat graph/symbol/search tools as last-resort fallback only if `context_pack` is explicitly insufficient. Analyze failed runs with `npm run analyze:failed-codex`.
+For mode D2, fallback search, graph, and symbol tools are not exposed.
+
+## Codex locked context-broker mode
+
+The first real Codex A/B test increased usage because Codex entered a tool exploration loop. MCP output was small, but the client-side token total spiked after repeated `context_pack`, graph, and symbol calls.
+
+Locked mode tests the pure context-broker hypothesis for Codex by using `MCP_TOOL_PROFILE=codex_locked`, which exposes only:
+
+- `context_status`
+- `context_pack`
+
+Recommended Codex ladder:
+
+- A: `no_mcp`
+- D1: `context_broker` with the full toolset
+- D2: `context_broker_locked`
+
+D2 is the main product proof only if:
+
+```text
+Codex client total D2 + MCP tokens D2 < no-MCP total
+```
+
+and quality is equal or better and routing is correct.
+
+**Codex auth-discovery locked proof is complete** (`PROVEN_SAVINGS_STABLE`). See [proofs/codex-auth-discovery-locked.md](proofs/codex-auth-discovery-locked.md). Full `context_broker` (D1) is exploratory only — it failed with `TOOL_LOOP_FAILURE`.
+
+## Claude locked context-broker mode
+
+Claude Code has Codex-level A/B tooling (`ab:claude:*`). **Claude savings are not proven.**
+
+Locked proof uses `MCP_TOOL_PROFILE=codex_locked` (alias: `locked`) — only `context_status` + `context_pack`. Do not use full `context_broker` for Claude proof.
+
+```bash
+npm run ab:claude:doctor
+npm run ab:claude:plan
+AB_ENABLE_CLAUDE_ADAPTER=1 npm run ab:claude -- --mode no_mcp --repo . --task auth-discovery --repeat 3 --yes
+AB_ENABLE_CLAUDE_ADAPTER=1 npm run ab:claude -- --mode context_broker_locked --repo . --task auth-discovery --repeat 3 --yes
+npm run ab:claude:ingest
+npm run ab:claude:report
+npm run ab:claude:real-check
+```
+
+If Claude CLI output lacks usage fields, use manual `ab:record` with real numbers. Never estimate tokens from transcript length. Proof doc: [proofs/claude-auth-discovery-locked.md](proofs/claude-auth-discovery-locked.md) — status `NOT_STARTED`.
+
+## Recommended testing strategy
+
+- First test: **A vs D2** for Codex locked-mode proof.
+- Full ladder test: **A/B/C/D1/D2** for deeper comparison.
+
+## Guided manual flow
+
+```bash
+npm run ab:create -- --client cursor --repo . --task auth-discovery
+
+npm run ab:prompt -- --mode no_mcp
+# run prompt in client manually, record usage
+
+npm run ab:record -- --mode no_mcp
+
+npm run telemetry:clean
+npm run ab:prompt -- --mode context_broker
+# run prompt in client manually
+npm run telemetry:report
+npm run ab:record -- --mode context_broker --use-telemetry
+
+npm run ab:report
+npm run ab:compare
+npm run ab:real-check
+```
+
+For route sanity checks before real A/B sessions:
+
+```bash
+npm run telemetry:clean
+npm run telemetry:context-test
+```
+
+## Recording results
+
+`ab:record` accepts either:
+
+- CLI flags (`--client-total`, `--quality`, `--found`, etc.)
+- Interactive stdin prompts if fields are omitted.
+
+If `clientTotalTokens` is missing but input/output/cache fields are present, the total is auto-calculated.
+
+If `--use-telemetry` is passed, MCP tool calls/tokens/largest response/tools can be auto-read from `.mcp-telemetry/logs.jsonl`.
+
+For Codex adapter runs:
+
+- `npm run ab:codex` tries to parse usage from Codex output.
+- If usage is not found, it prints: `Codex usage was not found in output. Record real Codex usage manually with ab:record.`
+- Do not infer usage from transcript length.
+
+## How verdicts are interpreted
+
+Baseline is `no_mcp`. For each MCP mode:
+
+- `combinedTotalTokens = clientTotalTokens + mcpEstimatedOutputTokens`
+- Quality validity requires:
+  - `answerQuality >= baselineQuality`
+  - `foundExpectedFiles === true`
+
+Single-run verdicts:
+
+- `saved_tokens`: best quality-valid MCP mode saves at least 5%.
+- `no_meaningful_change`: best quality-valid MCP mode is within +/-5%.
+- `increased_tokens`: all quality-valid MCP modes are more than 5% worse.
+- `quality_regression`: token savings exist, but quality parity fails.
+- `inconclusive`: required fields are missing.
+
+Repeat-aware verdicts:
+
+- `PROVEN_SAVINGS_STABLE`: mean and median improve by at least 5%, quality is equal or better, and no outlier is present.
+- `PROMISING_BUT_UNSTABLE`: median improves but the mean is worse because an outlier likely caused a tool-loop spike.
+- `INCREASED_USAGE_STABLE`: mean and median are both worse.
+- `INCREASED_USAGE_WITH_OUTLIER`: usage is worse and the largest repeat is more than 2x the median.
+
+## Optional command adapter (experimental)
+
+An optional adapter can run a configured client command, but it is disabled by default.
+
+Requirements:
+
+- Set `AB_ENABLE_COMMAND_ADAPTER=1`.
+- Create `.mcp-ab-tests/client-adapter.json`.
+- Pass explicit `--yes` when running adapter commands.
+
+Safety properties:
+
+- Uses `spawn(command, args, { shell: false })`.
+- Does not expose command execution via MCP tools.
+- Does not require storing API keys in this repo.
+- Codex automation must use isolated config files (project-scoped or temp) and must not mutate `~/.codex/config.toml`.
+
+## Important warning
+
+Benchmarks and telemetry can indicate potential improvements, but they are not proof of real savings. Real savings must be validated per client with A/B runs and quality parity.
+If telemetry shows `repo_map`/`search_code` dominating normal discovery runs, routing is not using v2 correctly.
+Do not claim savings from transcript length alone.
+
+For Codex, `ab:real-check` is the final gate. It returns `INCOMPLETE TEST` until real Codex client totals are auto-parsed or manually recorded.
+
+## Codex A/B testing quickstart
+
+```bash
+npm run ab:codex:plan
+
+AB_ENABLE_CODEX_ADAPTER=1 npm run ab:codex -- --mode no_mcp --repo . --repeat 3 --yes
+
+npm run telemetry:clean
+
+AB_ENABLE_CODEX_ADAPTER=1 npm run ab:codex -- --mode context_broker_locked --repo . --repeat 3 --yes
+
+npm run telemetry:report
+npm run ab:report
+npm run ab:compare
+npm run ab:real-check
+```
+
+Use isolated configs from `examples/codex/ab/`. If Codex usage is not parseable, record real usage manually with `ab:record` before running `ab:real-check`.

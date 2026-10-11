@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.mcp-telemetry/
+.mcp-benchmarks/
+.mcp-ab-tests/
+.mcp-self-improve/
+.repo-context-graph/
+.repo-context-queries/
+.context-packs/
+tests/fixtures/**/.repo-context-graph/
